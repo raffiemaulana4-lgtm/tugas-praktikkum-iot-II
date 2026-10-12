@@ -4,7 +4,7 @@
 #include <DHT.h>
 
 const char* ssid = "Raffi";
-const char* password = "12211333";
+const char* password = "123344556677";
 
 // Konfigurasi Pin
 const byte dhtPin = 2;        // D4 (GPIO 2)

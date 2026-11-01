@@ -1,103 +1,83 @@
-/*
- * ==============================================================================
- * PRAKTIKUM 7: SIMPUL SENSOR-AKTUATOR IOT UNTUK BROKER LOKAL
- * ==============================================================================
- * Program ini membaca sensor DHT11/22, menyusun paket telemetri JSON, mengirimkannya
- * ke Broker Mosquitto Lokal di Laptop, serta mendengarkan instruksi kendali LED.
- * ==============================================================================
- */
-
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <DHT.h>
 
-// 1. Kredensial Wi-Fi (Pastikan Laptop dan ESP8266 berada di Jaringan yang Sama!)
-const char* ssid     = "Nizar";
+// Kredensial Jaringan Wi-Fi
+const char* ssid = "iQOO Z10R 5G";
 const char* password = "12345678";
 
-// 2. Konfigurasi Broker MQTT Lokal
-// Ganti dengan Alamat IPv4 Laptop Anda yang didapat dari perintah 'ipconfig'!
-const char* mqttServer = "10.185.115.127"; 
-const int   mqttPort   = 1883;
+// Konfigurasi Broker MQTT Publik
+const char* mqttServer = "broker.hivemq.com";
+const int mqttPort = 1883;
+const char* clientId = "ESP8266_LabIoT_25782021_Full";
 
-// 3. Konfigurasi Identitas Simpul & Topik
-const char* clientId      = "ESP8266_Local_Node01";
-const char* topicPubTele  = "kampus/labiot/telemetri";
-const char* topicSubCmd   = "kampus/labiot/kendali";
+// Pembagian Topik Mandiri
+const char* topicPublish   = "kampus/labiot/25782021/telemetri";
+const char* topicSubscribe = "kampus/labiot/25782021/kendali";
+const char* topicAlert = "kampus/labiot/25782021/alert";
+const char* topicStatus = "kampus/labiot/25782021/status";
 
-// 4. Alokasi Pin Perangkat Keras
+bool isOverheatAlertSent = false;
+
+// Alokasi Pin Perangkat Keras
 const byte dhtPin = 2; // Pin D4 (GPIO 2)
 const byte ledPin = 5; // Pin D1 (GPIO 5)
-
-#define DHTTYPE DHT22 // Ganti DHT22 jika modul sensor berwarna putih
+#define DHTTYPE DHT22
 
 DHT dht(dhtPin, DHTTYPE);
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-unsigned long lastTeleTime = 0;
-const unsigned long teleInterval = 4000; // Siklus kirim data setiap 4 detik
+unsigned long lastTelemetryTime = 0;
+const unsigned long telemetryInterval = 4000; // Siklus kirim 4 detik
 
-// Penanganan Paket Masuk dari Node-RED melalui Broker Lokal
-void onMessageCallback(char* topic, byte* payload, unsigned int length) {
+void callback(char* topic, byte* payload, unsigned int length) {
   char incomingBuffer[length + 1];
   memcpy(incomingBuffer, payload, length);
   incomingBuffer[length] = '\0';
 
-  Serial.println("\n----------------------------------------");
-  Serial.printf("[INSTRUKSI MASUK] Topik: %s\n", topic);
-  Serial.printf("[PAYLOAD]         : %s\n", incomingBuffer);
+  Serial.println("----------------------------------------");
+  Serial.printf("[KONTROL DITERIMA] Topik: %s | Payload: %s\n", topic, incomingBuffer);
 
-  // Parsing JSON Instruksi Kendali: {"led": 1} atau {"led": 0}
   StaticJsonDocument<256> doc;
   DeserializationError err = deserializeJson(doc, incomingBuffer);
-
   if (err) {
-    Serial.printf("[ERROR] Gagal parsing JSON instruksi: %s\n", err.c_str());
+    Serial.println("Gagal membedah payload JSON!");
     return;
   }
 
-  // Evaluasi Kendali Indikator LED
   if (doc.containsKey("led")) {
-    int stateLED = doc["led"];
-    digitalWrite(ledPin, stateLED == 1 ? HIGH : LOW);
-    Serial.printf("--> [AKTUATOR] Status LED diubah: %s\n", stateLED == 1 ? "MENYALA (ON)" : "PADAM (OFF)");
-  } else {
-    Serial.println("[WARNING] Kunci 'led' tidak ditemukan dalam payload!");
+    int val = doc["led"];
+    digitalWrite(ledPin, val == 1 ? HIGH : LOW);
+    Serial.printf("--> [INDIKATOR] Status LED diubah: %s\n", val == 1 ? "MENYALA" : "PADAM");
   }
   Serial.println("----------------------------------------");
 }
 
-void connectToWiFi() {
-  Serial.println();
-  Serial.print("[Wi-Fi] Menghubungkan ke ");
-  Serial.println(ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\n[Wi-Fi] Berhasil Terhubung!");
-  Serial.print("[Wi-Fi] IP NodeMCU: ");
-  Serial.println(WiFi.localIP());
-}
-
-void reconnectMQTT() {
+void reconnect() {
   while (!client.connected()) {
-    Serial.print("[MQTT] Menghubungkan ke Broker Lokal (");
-    Serial.print(mqttServer);
-    Serial.print(")...");
+    Serial.print("Menghubungkan kembali ke Broker...");
 
-    // Format: client.connect(clientId, username, password)
-   if (client.connect(clientId, "admin", "rahasia123")) {
-      Serial.println(" Terhubung dengan Autentikasi Sah!");
-      client.subscribe(topicSubCmd);
-    } 
-    else {
-      Serial.printf(" Gagal (rc=%d). Coba lagi dalam 4 detik...\n", client.state());
+    // 1. Siapkan isi Pesan Wasiat (LWT) jika perangkat terputus mendadak
+    const char* lwtPayload = "{\"status\":\"OFFLINE\",\"keterangan\":\"Perangkat Terputus Tak Terduga\"}";
+    int lwtQoS = 1;
+    bool lwtRetain = true;
+
+    // 2. Hubungkan ke Broker MQTT dengan parameter LWT:
+    // client.connect(id, willTopic, willQoS, willRetain, willMessage)
+    if (client.connect(clientId, topicStatus, lwtQoS, lwtRetain, lwtPayload)) {
+      Serial.println(" Sukses Terhubung!");
+
+      // 3. Kirim status ONLINE sesaat setelah berhasil terhubung
+      const char* onlinePayload = "{\"status\":\"ONLINE\",\"keterangan\":\"Perangkat Beroperasi Normal\"}";
+      client.publish(topicStatus, onlinePayload, true); // true = retain flag
+
+      // 4. Subskripsi ke topik kendali
+      client.subscribe(topicSubscribe);
+      Serial.printf("Subskripsi Topik: %s\n", topicSubscribe);
+    } else {
+      Serial.printf("Gagal (rc=%d). Coba lagi dalam 4 detik...\n", client.state());
       delay(4000);
     }
   }
@@ -105,54 +85,87 @@ void reconnectMQTT() {
 
 void setup() {
   Serial.begin(115200);
-  
   pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, LOW); // Awal sistem: LED padam
+  digitalWrite(ledPin, LOW);
 
   dht.begin();
-  connectToWiFi();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Menghubungkan Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi Terkoneksi!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
 
   client.setServer(mqttServer, mqttPort);
-  client.setCallback(onMessageCallback);
-  client.setBufferSize(512);
+  client.setCallback(callback);
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectToWiFi();
-  }
-
   if (!client.connected()) {
-    reconnectMQTT();
+    reconnect();
   }
-  client.loop(); // Mendengarkan instruksi masuk
+  client.loop(); // Memelihara sesi TCP dan memproses callback masuk
 
-  // Pengiriman Telemetri Periodik Non-Blocking
   unsigned long now = millis();
-  if (now - lastTeleTime >= teleInterval) {
-    lastTeleTime = now;
+  if (now - lastTelemetryTime >= telemetryInterval) {
+    lastTelemetryTime = now;
 
     float t = dht.readTemperature();
     float h = dht.readHumidity();
 
     if (!isnan(t) && !isnan(h)) {
+
+      if (t > 31.0) {
+        // Nyalakan LED indikator bahaya secara otomatis
+        digitalWrite(ledPin, HIGH);
+
+        // Hanya kirim alert ke MQTT jika alert belum pernah terkirim sebelumnya
+        if (!isOverheatAlertSent) {
+          StaticJsonDocument<128> docAlert;
+          docAlert["status"] = "BAHAYA";
+          docAlert["parameter"] = "OVERHEAT";
+          docAlert["nilai_suhu"] = serialized(String(t, 1)); // Mengirim nilai suhu misal 31.8
+
+          char alertBuffer[128];
+          serializeJson(docAlert, alertBuffer);
+
+          client.publish(topicAlert, alertBuffer);
+          Serial.printf("[ALERT TERKIRIM] %s\n", alertBuffer);
+
+          // Pasang Latch agar tidak terkirim berulang kali
+          isOverheatAlertSent = true; 
+        }
+      } else {
+        // Jika suhu kembali aman (<= 31.0°C), reset latch agar siap untuk peringatan berikutnya
+        isOverheatAlertSent = false;
+      }
+
       StaticJsonDocument<256> docOut;
-      docOut["node_id"]    = clientId;
-      docOut["suhu"]       = serialized(String(t, 2));
+      docOut["node_id"] = clientId;
+      docOut["suhu"] = serialized(String(t, 2));
       docOut["kelembapan"] = serialized(String(h, 2));
       docOut["status_led"] = digitalRead(ledPin);
 
-      char teleBuffer[256];
-      serializeJson(docOut, teleBuffer);
-
-      bool success = client.publish(topicPubTele, teleBuffer);
-      if (success) {
-        Serial.printf("[TELEMETRI TERKIRIM] %s\n", teleBuffer);
+      if (t <= 31.0) {
+        docOut["kondisi_suhu"] = "NORMAL";
       } else {
-        Serial.println("[ERROR] Gagal mengirim paket telemetri ke broker lokal!");
+        docOut["kondisi_suhu"] = "PANAS";
       }
-    } else {
-      Serial.println("[ERROR] Gagal membaca data dari sensor DHT fisik!");
+
+      char buffer[256];
+      serializeJson(docOut, buffer);
+      
+      bool success = client.publish(topicPublish, buffer);
+      if (success) {
+        Serial.printf("[TELEMETRI TERKIRIM] %s\n", buffer);
+      } else {
+        Serial.println("[ERROR] Gagal memublikasikan telemetri!");
+      }
     }
   }
 }
